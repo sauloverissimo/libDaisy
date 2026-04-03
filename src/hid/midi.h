@@ -10,6 +10,7 @@
 #include "util/FIFO.h"
 #include "hid/midi_parser.h"
 #include "hid/usb_midi.h"
+#include "hid/midi2_processor.h"
 #include "sys/dma.h"
 #include "sys/system.h"
 
@@ -105,6 +106,10 @@ class MidiUartTransport
     /** @brief sends the buffer of bytes out of the UART peripheral */
     inline void Tx(uint8_t* buff, size_t size) { uart_.PollTx(buff, size); }
 
+    /** @brief no-op for UART (UMP callback is USB-only) */
+    typedef void (*MidiRxUmpCallback)(const uint32_t*, uint8_t, void*);
+    void SetUmpCallback(MidiRxUmpCallback, void*) {}
+
   private:
     UartHandler         uart_;
     uint8_t*            rx_buffer;
@@ -152,7 +157,7 @@ template <typename Transport>
 class MidiHandler
 {
   public:
-    MidiHandler() {}
+    MidiHandler() : midi2_(nullptr) {}
     ~MidiHandler() {}
 
     struct Config
@@ -211,6 +216,52 @@ class MidiHandler
         transport_.Tx(bytes, size);
     }
 
+    /** @brief Enable MIDI 2.0 support via a Midi2Processor.
+     *
+     *  When enabled, incoming bytes are fed to both the MIDI 1.0
+     *  parser (existing HasEvents/PopEvent path) and the midi2
+     *  pipeline (UMP conversion, MIDI-CI auto-response, typed
+     *  dispatch callbacks).
+     *
+     *  The processor must be initialized before calling this.
+     *  Call before StartReceive().
+     *
+     *  Example:
+     *  @code
+     *    Midi2Processor midi2;
+     *    Midi2Processor::Config m2cfg;
+     *    m2cfg.manufacturer_id = 0x7D; // prototyping
+     *    m2cfg.muid_seed = 0x12345;
+     *    midi2.Init(m2cfg);
+     *
+     *    // Register MIDI 2.0 callbacks
+     *    midi2.GetDispatch()->on_note_on = my_note_on;
+     *    midi2.GetDispatch()->context = &my_synth;
+     *
+     *    MidiUartHandler midi;
+     *    midi.Init(config);
+     *    midi.EnableMidi2(&midi2);
+     *    midi.StartReceive();
+     *  @endcode
+     *
+     *  @param proc Pointer to an initialized Midi2Processor (lifetime
+     *              must exceed the MidiHandler)
+     */
+    void EnableMidi2(Midi2Processor* proc)
+    {
+        if(proc == nullptr)
+            return;
+        midi2_ = proc;
+        midi2_->SetTx(Midi2TxBridge, this);
+        transport_.SetUmpCallback(UmpCallbackBridge, this);
+    }
+
+    /** @brief Returns true if MIDI 2.0 processing is enabled */
+    bool Midi2Enabled() const { return midi2_ != nullptr; }
+
+    /** @brief Access the Midi2Processor (nullptr if not enabled) */
+    Midi2Processor* GetMidi2() { return midi2_; }
+
     /** Feed in bytes to parser state machine from an external source.
         Populates internal FIFO queue with MIDI Messages.
 
@@ -219,11 +270,34 @@ class MidiHandler
     */
     void Parse(uint8_t byte)
     {
+        /* MIDI 1.0 path: parser -> FIFO (always active) */
         MidiEvent event;
         if(parser_.Parse(byte, &event))
         {
             event_q_.PushBack(event);
         }
+
+        /* MIDI 2.0 path: conv -> proc -> dispatch (if enabled) */
+        if(midi2_)
+        {
+            midi2_->Feed(byte);
+        }
+    }
+
+    /** Feed UMP words from native MIDI 2.0 transport (Alt 1).
+     *  Does not feed MidiParser or MIDI 1.0 FIFO. */
+    void ParseUmp(const uint32_t* words, uint8_t word_count)
+    {
+        if(midi2_)
+        {
+            midi2_->FeedUmp(words, word_count);
+        }
+    }
+
+    /** Send UMP words through the transport (native MIDI 2.0). */
+    void SendUmpMessage(const uint32_t* words, uint8_t word_count)
+    {
+        transport_.Tx((uint8_t*)words, word_count * 4);
     }
 
   private:
@@ -231,6 +305,22 @@ class MidiHandler
     Transport            transport_;
     MidiParser           parser_;
     FIFO<MidiEvent, 256> event_q_;
+    Midi2Processor*      midi2_;
+
+    /** Static Tx bridge: routes midi2 CI responses through the transport */
+    static void Midi2TxBridge(uint8_t* data, size_t size, void* context)
+    {
+        MidiHandler* handler = reinterpret_cast<MidiHandler*>(context);
+        handler->transport_.Tx(data, size);
+    }
+
+    /** Static UMP callback bridge: routes UMP words to ParseUmp */
+    static void
+    UmpCallbackBridge(const uint32_t* words, uint8_t word_count, void* context)
+    {
+        MidiHandler* handler = reinterpret_cast<MidiHandler*>(context);
+        handler->ParseUmp(words, word_count);
+    }
 
     static void ParseCallback(uint8_t* data, size_t size, void* context)
     {
