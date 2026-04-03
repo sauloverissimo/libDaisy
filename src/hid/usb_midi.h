@@ -44,9 +44,14 @@ class MidiUsbTransport
         Config() : periph(INTERNAL), tx_retry_count(3) {}
     };
 
+    typedef void (*MidiRxUmpCallback)(const uint32_t* words,
+                                      uint8_t         word_count,
+                                      void*           context);
+
     void Init(Config config);
 
     void StartRx(MidiRxParseCallback callback, void* context);
+    void SetUmpCallback(MidiRxUmpCallback cb, void* context);
     bool RxActive();
     void FlushRx();
     void Tx(uint8_t* buffer, size_t size);
@@ -55,7 +60,7 @@ class MidiUsbTransport
 
     MidiUsbTransport() : pimpl_(nullptr) {}
     ~MidiUsbTransport() {}
-    MidiUsbTransport(const MidiUsbTransport& other) = default;
+    MidiUsbTransport(const MidiUsbTransport& other)            = default;
     MidiUsbTransport& operator=(const MidiUsbTransport& other) = default;
 
   private:
