@@ -178,6 +178,9 @@ void MidiUsbTransport::Impl::UsbToUmp(uint8_t* buffer, uint32_t length)
         uint32_t w0;
         memcpy(&w0, buffer + offset, 4);
 
+        /* Word count by message type. Intentionally local instead of
+           calling midi2_msg_word_count() to avoid a dependency from
+           the transport layer on the midi2 library. */
         uint8_t mt = (w0 >> 28) & 0x0F;
         uint8_t wc;
         switch(mt)

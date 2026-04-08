@@ -93,9 +93,9 @@ void Midi2Processor::OnUmp(const uint32_t* words, uint8_t count, void* ctx)
 /*--------------------------------------------------------------------+
  * UMP Stream auto-responders (Endpoint Discovery, Config, FB)
  *--------------------------------------------------------------------*/
-void Midi2Processor::OnEndpointDiscovery(uint8_t ump_ver_major,
-                                         uint8_t ump_ver_minor,
-                                         uint8_t filter,
+void Midi2Processor::OnEndpointDiscovery(uint8_t /*ump_ver_major*/,
+                                         uint8_t /*ump_ver_minor*/,
+                                         uint8_t /*filter*/,
                                          void*   ctx)
 {
     Midi2Processor* self = static_cast<Midi2Processor*>(ctx);
@@ -116,8 +116,8 @@ void Midi2Processor::OnEndpointDiscovery(uint8_t ump_ver_major,
 }
 
 void Midi2Processor::OnConfigRequest(uint8_t protocol,
-                                     bool    rx_jr,
-                                     bool    tx_jr,
+                                     bool    /*rx_jr*/,
+                                     bool    /*tx_jr*/,
                                      void*   ctx)
 {
     Midi2Processor* self = static_cast<Midi2Processor*>(ctx);
@@ -128,7 +128,9 @@ void Midi2Processor::OnConfigRequest(uint8_t protocol,
     self->SendUmp(w, 4);
 }
 
-void Midi2Processor::OnFbDiscovery(uint8_t fb_num, uint8_t filter, void* ctx)
+void Midi2Processor::OnFbDiscovery(uint8_t /*fb_num*/,
+                                   uint8_t /*filter*/,
+                                   void*   ctx)
 {
     Midi2Processor* self = static_cast<Midi2Processor*>(ctx);
     uint32_t        w[4];
