@@ -57,7 +57,9 @@ int main(void)
         = MidiUsbTransport::Config::Periph::INTERNAL;
     midi.Init(midi_config);
 
-    /* MIDI 2.0 processor */
+    /* MIDI 2.0 processor.
+     * Defaults applied: nak_on_unknown = true (Appendix E NAK responder
+     * for CI sub-ids the convenience responder does not handle). */
     Midi2Processor::Config m2cfg;
     m2cfg.manufacturer_id = 0x7D;
     m2cfg.family_id       = 0x0001;
@@ -66,6 +68,14 @@ int main(void)
     m2cfg.muid_seed       = 0xDA15;
     m2cfg.group           = 0;
     midi2.Init(m2cfg);
+
+    /* Optional: provide a 32-bit random source for MUID generation and
+     * collision recovery. Recommended when several Daisy devices share
+     * a MIDI 2.0 bus; without it the MUID is deterministic from
+     * cfg.muid_seed. Wire to HAL_RNG_GenerateRandomNumber, ADC noise,
+     * unique chip id + timer, or any other entropy source.
+     *
+     *   midi2.SetRng(my_random_u32, nullptr); */
 
     midi2.GetDispatch()->upscale_mt2 = true;
     midi2.GetDispatch()->on_note_on  = OnNoteOn;

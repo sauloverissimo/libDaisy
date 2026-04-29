@@ -85,6 +85,24 @@ class Midi2Processor
         tx_ctx_ = context;
     }
 
+    /** Set the random source for MUID generation and collision recovery.
+     *  Optional. When unset, the MUID stays at the deterministic value
+     *  derived from Config::muid_seed (fine for a single device on the bus,
+     *  fragile when several Daisy devices coexist).
+     *
+     *  Typical Daisy wiring: call this from setup() after the user has
+     *  enabled the STM32H7 RNG peripheral, with a small wrapper that
+     *  returns 32 bits from HAL_RNG_GenerateRandomNumber. Any other 32-bit
+     *  entropy source works too (audio noise, ADC LSBs, unique chip id +
+     *  timer, etc).
+     *
+     *  @param rng     callback returning 32 random bits
+     *  @param context user pointer passed to the callback */
+    void SetRng(midi2_ci_rng_fn rng, void* context)
+    {
+        midi2_ci_set_rng(&ci_, rng, context);
+    }
+
     /** Feed one incoming MIDI 1.0 byte.
      *  Converts to UMP, dispatches to callbacks, handles CI. */
     void Feed(uint8_t byte);
