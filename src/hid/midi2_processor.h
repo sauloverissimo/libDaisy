@@ -54,13 +54,20 @@ class Midi2Processor
         /** UMP group for byte-to-UMP conversion (0-15) */
         uint8_t group;
 
+        /** When true, the convenience CI responder replies NAK to any
+         *  CI command it does not understand, per M2-101-UM Appendix E.
+         *  When false, unknown CI commands are silently ignored.
+         *  Default true (spec recommendation). */
+        bool nak_on_unknown;
+
         Config()
         : manufacturer_id(0),
           family_id(0),
           model_id(0),
           version_id(0),
           muid_seed(0),
-          group(0)
+          group(0),
+          nak_on_unknown(true)
         {
         }
     };

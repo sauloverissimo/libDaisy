@@ -36,6 +36,7 @@ void Midi2Processor::Init(Config config)
                           config.model_id,
                           config.version_id);
     midi2_ci_set_write_fn(&ci_, Midi2Processor::CiWriteFn, this);
+    midi2_ci_set_nak_on_unknown(&ci_, config.nak_on_unknown);
 
     /* UMP typed dispatch */
     midi2_dispatch_init(&dispatch_);
