@@ -22,6 +22,16 @@
  * THE SOFTWARE.
  */
 
+/*
+ * midi2_ci.h - MIDI-CI convenience responder
+ *
+ * Part of midi2 - Portable MIDI 2.0 library (C99)
+ * https://github.com/sauloverissimo/midi2
+ *
+ * Spec: MIDI-CI (M2-101-UM v1.2, Jun 2023)
+ * Version: 0.3.0
+ */
+
 #ifndef MIDI2_CI_H
 #define MIDI2_CI_H
 
@@ -66,7 +76,21 @@ typedef struct {
   const char         *static_value;  /**< used if getter is NULL */
   midi2_ci_pe_getter  getter;
   midi2_ci_pe_setter  setter;
+  bool                subscribable;  /**< v0.3.0+: eligible for PE Subscribe */
 } midi2_ci_property;
+
+/*--------------------------------------------------------------------+
+ * Subscriber registry entry (caller-provided array, v0.3.0+)
+ *
+ * name_copy holds up to 36 chars per M2-105 PE resource name limit
+ * plus NUL terminator, so the responder keeps a stable reference even
+ * if the app frees the resource name string passed to subscribe_add.
+ *--------------------------------------------------------------------*/
+typedef struct {
+  uint32_t caller_muid;
+  char     name_copy[37];
+  uint8_t  in_use;  /**< 0 = free slot; non-zero = active */
+} midi2_ci_subscriber;
 
 /*--------------------------------------------------------------------+
  * State struct (user-allocated)
@@ -80,6 +104,17 @@ typedef struct {
  *   midi2_ci_state ci;
  *   midi2_ci_init(&ci, seed, my_profiles, 4, my_props, 2);
  *--------------------------------------------------------------------*/
+/*--------------------------------------------------------------------+
+ * RNG callback (v0.2.4+)
+ *
+ * Platform-specific randomness source. When set via midi2_ci_set_rng(),
+ * the convenience responder automatically handles MUID regeneration on
+ * Invalidate MUID and peer MUID collisions. Only the lower 28 bits of
+ * the returned value are used. Reserved values 0x00000000 and
+ * 0x0FFFFFFF (broadcast) are automatically avoided by midi2_ci_new_muid.
+ *--------------------------------------------------------------------*/
+typedef uint32_t (*midi2_ci_rng_fn)(void *context);
+
 typedef struct {
   /* Device identity (configured by user) */
   uint32_t manufacturer_id;   /**< 3-byte SysEx Manufacturer ID in lower 24 bits */
@@ -106,6 +141,28 @@ typedef struct {
 
   /* User context for PE callbacks */
   void               *context;
+
+  /* RNG for MUID regeneration (v0.2.4+). NULL = no auto-regen. */
+  midi2_ci_rng_fn    rng;
+  void              *rng_context;
+
+  /* When true, process_sysex replies with a NAK (Sub-ID#2 0x7F) for any
+   * CI sub-id not handled by the convenience responder (v0.2.4+).
+   * Default false to preserve v0.2.3 behavior. */
+  bool               nak_on_unknown;
+
+  /* When true, the convenience responder broadcasts an Invalidate MUID
+   * frame for the old MUID whenever it regenerates because an inbound
+   * src_muid collided with ours. M2-101-UM Appendix E 2. Default: true
+   * (v0.3.0+). Implementation was already present in v0.2.4 but always
+   * on; this flag gates it. */
+  bool               auto_invalidate_on_collision;
+
+  /* Subscribers: caller-provided storage (v0.3.0+). NULL when the state
+   * was built with the legacy midi2_ci_init (no subscribe/notify). */
+  midi2_ci_subscriber *subscribers;
+  uint8_t              subscriber_capacity;
+  uint8_t              subscriber_count;
 } midi2_ci_state;
 
 /*--------------------------------------------------------------------+
@@ -113,6 +170,8 @@ typedef struct {
  *--------------------------------------------------------------------*/
 
 /** Initialize state with caller-provided storage.
+ *  Delegates to midi2_ci_init_ex(..., NULL, 0), so the subscriber
+ *  registry is absent and subscribe/notify APIs return ERR_FULL.
  *  @param state         State struct (caller-allocated)
  *  @param muid_seed     Random or unique value for MUID generation (28-bit)
  *  @param profiles      Caller's profile array, or NULL if no profiles needed
@@ -123,6 +182,15 @@ void midi2_ci_init(midi2_ci_state *state, uint32_t muid_seed,
                      uint8_t (*profiles)[5], uint8_t max_profiles,
                      midi2_ci_property *properties, uint8_t max_properties);
 
+/** Extended initializer that also wires a subscriber-registry array
+ *  for PE Subscribe / Notify. Pass NULL / 0 for the subscribers
+ *  argument to match midi2_ci_init semantics.
+ *  (v0.3.0+) */
+void midi2_ci_init_ex(midi2_ci_state *state, uint32_t muid_seed,
+                       uint8_t (*profiles)[5], uint8_t max_profiles,
+                       midi2_ci_property *properties, uint8_t max_properties,
+                       midi2_ci_subscriber *subscribers, uint8_t max_subscribers);
+
 /** Configure device identity */
 void midi2_ci_set_identity(midi2_ci_state *state,
                              uint32_t manufacturer_id, uint16_t family_id,
@@ -131,6 +199,31 @@ void midi2_ci_set_identity(midi2_ci_state *state,
 /** Set the write function (how CI sends SysEx responses) */
 void midi2_ci_set_write_fn(midi2_ci_state *state,
                               midi2_proc_write_fn write_fn, void *context);
+
+/** Install a platform RNG so the convenience responder can regenerate the
+ *  MUID on Invalidate MUID messages and on peer MUID collisions. Without
+ *  this, both situations are silently ignored (v0.2.3 behavior).
+ *  The callback is invoked from within process_sysex; it must be re-entrant
+ *  and should return quickly. Only the lower 28 bits matter. (v0.2.4+) */
+void midi2_ci_set_rng(midi2_ci_state *state,
+                         midi2_ci_rng_fn rng, void *context);
+
+/** Enable/disable automatic NAK (Sub-ID#2 0x7F, status 0x01 NOT_SUPPORTED)
+ *  replies for CI sub-ids the convenience responder does not handle.
+ *  M2-101-UM Appendix E requires a device to "Be able to send a NAK message
+ *  when appropriate". Default: false (v0.2.3 compatible). (v0.2.4+) */
+void midi2_ci_set_nak_on_unknown(midi2_ci_state *state, bool enabled);
+
+/** Enable/disable automatic broadcast of an Invalidate MUID frame for the
+ *  old MUID whenever the convenience responder regenerates due to an
+ *  inbound collision. Default: true (v0.3.0+). */
+void midi2_ci_set_auto_invalidate_on_collision(midi2_ci_state *state, bool enabled);
+
+/** Generate a fresh 28-bit MUID using the configured RNG, avoiding the
+ *  reserved values 0x00000000 and 0x0FFFFFFF (broadcast). If no RNG is
+ *  set, falls back to perturbing the current MUID. Returns the new MUID
+ *  and also stores it into state->muid. (v0.2.4+) */
+uint32_t midi2_ci_new_muid(midi2_ci_state *state);
 
 /** Add a profile. Returns MIDI2_CI_OK or MIDI2_CI_ERR_FULL. */
 int midi2_ci_add_profile(midi2_ci_state *state, const uint8_t profile_id[5]);
@@ -147,6 +240,52 @@ int midi2_ci_add_property_dynamic(midi2_ci_state *state,
                                      const char *name,
                                      midi2_ci_pe_getter getter,
                                      midi2_ci_pe_setter setter);
+
+/** Remove a property by name. Remaining properties are shifted left to
+ *  preserve contiguous storage. Returns MIDI2_CI_OK or
+ *  MIDI2_CI_ERR_NOT_FOUND. Symmetric with midi2_ci_remove_profile.
+ *  (v0.3.0+) */
+int midi2_ci_remove_property(midi2_ci_state *state, const char *name);
+
+/** Clear all registered profiles (count-only reset; storage contents are
+ *  left intact for caller inspection or reuse). (v0.3.0+) */
+void midi2_ci_reset_profiles(midi2_ci_state *state);
+
+/** Clear all registered properties (count-only reset; storage contents
+ *  are left intact for caller inspection or reuse). (v0.3.0+) */
+void midi2_ci_reset_properties(midi2_ci_state *state);
+
+/** Toggle the subscribable flag on a registered property at runtime.
+ *  Returns MIDI2_CI_OK or MIDI2_CI_ERR_NOT_FOUND. (v0.3.0+) */
+int midi2_ci_pe_set_subscribable(midi2_ci_state *state,
+                                  const char *name, bool subscribable);
+
+/** Register a subscriber (caller_muid) for the named PE resource. The
+ *  property must be registered and marked subscribable. Duplicate
+ *  (muid, name) pairs are idempotent and return OK.
+ *  @return MIDI2_CI_OK, MIDI2_CI_ERR_NOT_FOUND (property unknown or
+ *          not subscribable), or MIDI2_CI_ERR_FULL (no subscriber
+ *          capacity, including the case of midi2_ci_init without a
+ *          subscribers array). (v0.3.0+) */
+int midi2_ci_subscribe_add(midi2_ci_state *state, uint32_t caller_muid,
+                            const char *resource_name);
+
+/** Remove a subscriber from the named resource.
+ *  @return MIDI2_CI_OK or MIDI2_CI_ERR_NOT_FOUND. (v0.3.0+) */
+int midi2_ci_subscribe_remove(midi2_ci_state *state, uint32_t caller_muid,
+                               const char *resource_name);
+
+/** Fan out a PE Notify frame to every subscriber of the named resource.
+ *  Returns MIDI2_CI_OK even when the subscriber list is empty, or
+ *  MIDI2_CI_ERR_NOT_FOUND when the property is unknown. Emission uses
+ *  the state's write_fn (same path as Discovery / PE Reply).
+ *  (v0.3.0+) */
+int midi2_ci_notify_property_changed(midi2_ci_state *state,
+                                      const char *resource_name);
+
+/** Return the current number of active subscribers across all
+ *  resources. (v0.3.0+) */
+uint8_t midi2_ci_get_subscriber_count(const midi2_ci_state *state);
 
 /** Process incoming SysEx that might be MIDI-CI.
  *  Returns true if the message was handled (CI), false if not.

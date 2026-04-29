@@ -22,6 +22,16 @@
  * THE SOFTWARE.
  */
 
+/*
+ * midi2_msg.h - UMP message construction and parsing
+ *
+ * Part of midi2 - Portable MIDI 2.0 library (C99)
+ * https://github.com/sauloverissimo/midi2
+ *
+ * Spec: MIDI 2.0 UMP (M2-104-UM v1.1.2, Nov 2024)
+ * Version: 0.3.0
+ */
+
 #ifndef MIDI2_MSG_H
 #define MIDI2_MSG_H
 
@@ -163,6 +173,23 @@ static inline uint8_t  midi2_msg_get_note(const uint32_t *w)     { return (uint8
 static inline uint16_t midi2_msg_get_velocity(const uint32_t *w) { return (uint16_t)(w[1] >> 16); }
 /** @brief Extract full word 1 (32-bit data payload). */
 static inline uint32_t midi2_msg_get_data(const uint32_t *w)     { return w[1]; }
+
+/** @brief Rewrite the Group field of a UMP word in-place.
+ *
+ *  Only MT 0x2 (MIDI 1.0 CV), 0x3 (SysEx7), 0x4 (MIDI 2.0 CV) and
+ *  0x5 (Data128/SysEx8) carry a Group field in word 0 bits [27:24].
+ *  Utility, System Real-Time, Flex Data and UMP Stream words have
+ *  no Group field and are left untouched.
+ *
+ *  Useful for routing pipelines that need to re-stamp the group of
+ *  forwarded messages without rebuilding the word from scratch.
+ *  (v0.3.0+) */
+static inline void midi2_msg_set_group(uint32_t *word0, uint8_t group) {
+  uint8_t mt = (uint8_t)((*word0 >> 28) & 0x0Fu);
+  if (mt >= 0x2u && mt <= 0x5u) {
+    *word0 = (*word0 & 0xF0FFFFFFu) | ((uint32_t)(group & 0x0Fu) << 24);
+  }
+}
 
 /*--------------------------------------------------------------------+
  * Value Scaling (MIDI 2.0 spec section 4.2.1)
@@ -367,6 +394,67 @@ static inline uint32_t midi2_msg_system_2byte(uint8_t group, uint8_t status, uin
 static inline uint32_t midi2_msg_system_3byte(uint8_t group, uint8_t status,
                                                 uint8_t data1, uint8_t data2) {
   return midi2_msg_system(group, status) | ((uint32_t)data1 << 8) | (uint32_t)data2;
+}
+
+/*--------------------------------------------------------------------+
+ * System Real-Time + System Common named wrappers (M2-104-UM section 4.3,
+ * v0.3.0+). Each calls the corresponding generic builder above with the
+ * canonical status byte. Useful for pattern-matching senders and for
+ * call sites that prefer the named shortcut over the magic-number form.
+ * All inline; zero ROM cost when not called.
+ *--------------------------------------------------------------------*/
+
+/** @brief Tune Request (status 0xF6, 1-byte System Common). */
+static inline uint32_t midi2_msg_system_tune_request(uint8_t group) {
+  return midi2_msg_system(group, 0xF6);
+}
+
+/** @brief Timing Clock (status 0xF8, 1-byte System Real-Time). */
+static inline uint32_t midi2_msg_system_timing_clock(uint8_t group) {
+  return midi2_msg_system(group, 0xF8);
+}
+
+/** @brief Start (status 0xFA, 1-byte System Real-Time, sequencer start). */
+static inline uint32_t midi2_msg_system_start(uint8_t group) {
+  return midi2_msg_system(group, 0xFA);
+}
+
+/** @brief Continue (status 0xFB, 1-byte System Real-Time). */
+static inline uint32_t midi2_msg_system_continue(uint8_t group) {
+  return midi2_msg_system(group, 0xFB);
+}
+
+/** @brief Stop (status 0xFC, 1-byte System Real-Time). */
+static inline uint32_t midi2_msg_system_stop(uint8_t group) {
+  return midi2_msg_system(group, 0xFC);
+}
+
+/** @brief Active Sensing (status 0xFE, 1-byte System Real-Time). */
+static inline uint32_t midi2_msg_system_active_sensing(uint8_t group) {
+  return midi2_msg_system(group, 0xFE);
+}
+
+/** @brief System Reset (status 0xFF, 1-byte System Real-Time). */
+static inline uint32_t midi2_msg_system_reset(uint8_t group) {
+  return midi2_msg_system(group, 0xFF);
+}
+
+/** @brief MIDI Time Code Quarter Frame (status 0xF1, 2-byte System Common). */
+static inline uint32_t midi2_msg_system_mtc(uint8_t group, uint8_t time_code) {
+  return midi2_msg_system_2byte(group, 0xF1, time_code & 0x7F);
+}
+
+/** @brief Song Select (status 0xF3, 2-byte System Common). */
+static inline uint32_t midi2_msg_system_song_select(uint8_t group, uint8_t song) {
+  return midi2_msg_system_2byte(group, 0xF3, song & 0x7F);
+}
+
+/** @brief Song Position Pointer (status 0xF2, 3-byte System Common).
+ *  @param position 14-bit position; LSB stored at data1, MSB at data2. */
+static inline uint32_t midi2_msg_system_song_position(uint8_t group, uint16_t position) {
+  return midi2_msg_system_3byte(group, 0xF2,
+                                 (uint8_t)(position & 0x7F),
+                                 (uint8_t)((position >> 7) & 0x7F));
 }
 
 /*--------------------------------------------------------------------+
@@ -980,6 +1068,150 @@ static inline bool midi2_msg_mt2_to_mt4(uint32_t mt2_word, uint32_t out[2]) {
       return true;
 
     default:
+      return false;
+  }
+}
+
+/*--------------------------------------------------------------------+
+ * Protocol Translation: MT 0x4 (MIDI 2.0 CV) -> MT 0x2 (MIDI 1.0 CV)
+ *
+ * Inverse of midi2_msg_mt2_to_mt4. Lossy by spec: MIDI 1.0 CV cannot
+ * carry RPN/NRPN/Rel/Per-Note in a single word (would require a 4-CC
+ * sequence). Those statuses are skipped (returns 0 words emitted).
+ * Caller detects skips by comparing emitted word count against the
+ * expected count (1 word per MT 0x4 message that is supported).
+ *
+ * Mapping per M2-115 section 4.2 / 4.3:
+ *   Note On/Off       : velocity 16-bit -> 7-bit
+ *   CC                : value    32-bit -> 7-bit
+ *   Pitch Bend        :          32-bit -> 14-bit (LSB / MSB split)
+ *   Channel Pressure  :          32-bit -> 7-bit
+ *   Poly Pressure     :          32-bit -> 7-bit
+ *   Program Change    : program byte preserved; bank dropped
+ *   Per-Note CC/PB/Mgmt, RPN/NRPN/Rel: dropped (no MIDI 1.0 form)
+ *
+ *  @return number of MT 0x2 words written (0 or 1).
+ *  (v0.3.0+) */
+static inline uint32_t midi2_msg_mt4_to_mt2(const uint32_t mt4_words[2],
+                                             uint32_t *out_word) {
+  if (out_word == NULL) return 0;
+  uint8_t mt = (uint8_t)((mt4_words[0] >> 28) & 0x0Fu);
+  if (mt != MIDI2_MT_MIDI2_CV) return 0;
+  uint8_t grp  = (uint8_t)((mt4_words[0] >> 24) & 0x0Fu);
+  uint8_t stat = (uint8_t)((mt4_words[0] >> 16) & 0xFFu);
+  uint8_t hi   = (uint8_t)(stat & 0xF0u);
+  uint8_t ch   = (uint8_t)(stat & 0x0Fu);
+
+  switch (hi) {
+    case MIDI2_STATUS_NOTE_OFF:
+    case MIDI2_STATUS_NOTE_ON: {
+      uint8_t  note  = (uint8_t)((mt4_words[0] >> 8) & 0x7Fu);
+      uint16_t vel16 = (uint16_t)((mt4_words[1] >> 16) & 0xFFFFu);
+      uint8_t  vel7  = midi2_msg_scale_down_16to7(vel16);
+      *out_word = ((uint32_t)MIDI2_MT_MIDI1_CV << 28)
+                | ((uint32_t)grp << 24)
+                | ((uint32_t)hi  << 16)
+                | ((uint32_t)ch  << 16)
+                | ((uint32_t)note << 8)
+                | (uint32_t)vel7;
+      return 1;
+    }
+    case MIDI2_STATUS_POLY_PRESSURE: {
+      uint8_t note = (uint8_t)((mt4_words[0] >> 8) & 0x7Fu);
+      uint8_t v7   = midi2_msg_scale_down_32to7(mt4_words[1]);
+      *out_word = ((uint32_t)MIDI2_MT_MIDI1_CV << 28)
+                | ((uint32_t)grp << 24)
+                | ((uint32_t)MIDI2_STATUS_POLY_PRESSURE << 16)
+                | ((uint32_t)ch << 16)
+                | ((uint32_t)note << 8)
+                | (uint32_t)v7;
+      return 1;
+    }
+    case MIDI2_STATUS_CC: {
+      uint8_t cc = (uint8_t)((mt4_words[0] >> 8) & 0x7Fu);
+      uint8_t v7 = midi2_msg_scale_down_32to7(mt4_words[1]);
+      *out_word = ((uint32_t)MIDI2_MT_MIDI1_CV << 28)
+                | ((uint32_t)grp << 24)
+                | ((uint32_t)MIDI2_STATUS_CC << 16)
+                | ((uint32_t)ch << 16)
+                | ((uint32_t)cc << 8)
+                | (uint32_t)v7;
+      return 1;
+    }
+    case MIDI2_STATUS_PROGRAM: {
+      uint8_t prog = (uint8_t)((mt4_words[1] >> 24) & 0x7Fu);
+      *out_word = ((uint32_t)MIDI2_MT_MIDI1_CV << 28)
+                | ((uint32_t)grp << 24)
+                | ((uint32_t)MIDI2_STATUS_PROGRAM << 16)
+                | ((uint32_t)ch << 16)
+                | ((uint32_t)prog << 8);
+      return 1;
+    }
+    case MIDI2_STATUS_CHAN_PRESSURE: {
+      uint8_t v7 = midi2_msg_scale_down_32to7(mt4_words[1]);
+      *out_word = ((uint32_t)MIDI2_MT_MIDI1_CV << 28)
+                | ((uint32_t)grp << 24)
+                | ((uint32_t)MIDI2_STATUS_CHAN_PRESSURE << 16)
+                | ((uint32_t)ch << 16)
+                | ((uint32_t)v7 << 8);
+      return 1;
+    }
+    case MIDI2_STATUS_PITCH_BEND: {
+      uint16_t pb14 = midi2_msg_scale_down_32to14(mt4_words[1]);
+      *out_word = ((uint32_t)MIDI2_MT_MIDI1_CV << 28)
+                | ((uint32_t)grp << 24)
+                | ((uint32_t)MIDI2_STATUS_PITCH_BEND << 16)
+                | ((uint32_t)ch << 16)
+                | ((uint32_t)(pb14 & 0x7Fu) << 8)
+                | (uint32_t)((pb14 >> 7) & 0x7Fu);
+      return 1;
+    }
+    default:
+      /* RPN/NRPN/Rel/Per-Note dropped; caller detects via count. */
+      return 0;
+  }
+}
+
+/*--------------------------------------------------------------------+
+ * USB MIDI 1.0 cable event -> UMP MT 0x2
+ *
+ * USB MIDI v1.0 class delivers Channel Voice and System Common
+ * messages as 4-byte cable events:
+ *   byte 0 = (cable_number << 4) | CIN
+ *   byte 1 = MIDI status byte
+ *   byte 2 = data 1
+ *   byte 3 = data 2
+ * Packed LSB-first into the uint32_t argument.
+ *
+ * Supported CINs: 0x2, 0x3 (System Common), 0x8-0xE (Channel Voice).
+ * Reserved CINs (0x0, 0x1) and SysEx fragments (0x4-0x7, 0xF) return
+ * false; the latter need stateful reassembly handled by midi2_conv.
+ *
+ *  @return true on success, false on unsupported CIN or NULL output.
+ *  (v0.3.0+) */
+static inline bool midi2_msg_cable_event_to_ump(uint32_t cable_event,
+                                                 uint8_t group,
+                                                 uint32_t *ump_out) {
+  if (ump_out == NULL) return false;
+  uint8_t b0     = (uint8_t)(cable_event        & 0xFFu);
+  uint8_t status = (uint8_t)((cable_event >>  8) & 0xFFu);
+  uint8_t data1  = (uint8_t)((cable_event >> 16) & 0xFFu);
+  uint8_t data2  = (uint8_t)((cable_event >> 24) & 0xFFu);
+  uint8_t cin    = (uint8_t)(b0 & 0x0Fu);
+
+  switch (cin) {
+    case 0x2: case 0x3:
+    case 0x8: case 0x9: case 0xA: case 0xB:
+    case 0xC: case 0xD: case 0xE:
+      *ump_out = ((uint32_t)MIDI2_MT_MIDI1_CV << 28)
+               | ((uint32_t)(group & 0x0Fu) << 24)
+               | ((uint32_t)status << 16)
+               | ((uint32_t)(data1 & 0x7Fu) << 8)
+               | ((uint32_t)(data2 & 0x7Fu));
+      return true;
+    default:
+      /* Reserved (0x0, 0x1) or SysEx fragment (0x4-0x7, 0xF).
+       * SysEx fragments are handled by midi2_conv (stateful). */
       return false;
   }
 }

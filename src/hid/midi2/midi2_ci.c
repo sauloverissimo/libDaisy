@@ -22,21 +22,50 @@
  * THE SOFTWARE.
  */
 
+/*
+ * midi2_ci.c - MIDI-CI convenience responder implementation
+ *
+ * Part of midi2 - Portable MIDI 2.0 library (C99)
+ * https://github.com/sauloverissimo/midi2
+ *
+ * Spec: MIDI-CI (M2-101-UM v1.2, Jun 2023)
+ * Version: 0.3.0
+ */
+
 #include "midi2_ci.h"
 #include <string.h>
 
 /*--------------------------------------------------------------------+
  * Init
  *--------------------------------------------------------------------*/
-void midi2_ci_init(midi2_ci_state *state, uint32_t muid_seed,
-                     uint8_t (*profiles)[5], uint8_t max_profiles,
-                     midi2_ci_property *properties, uint8_t max_properties) {
+void midi2_ci_init_ex(midi2_ci_state *state, uint32_t muid_seed,
+                       uint8_t (*profiles)[5], uint8_t max_profiles,
+                       midi2_ci_property *properties, uint8_t max_properties,
+                       midi2_ci_subscriber *subscribers, uint8_t max_subscribers) {
   memset(state, 0, sizeof(midi2_ci_state));
   state->muid = muid_seed & 0x0FFFFFFF;
   state->profiles = profiles;
   state->profile_capacity = max_profiles;
   state->properties = properties;
   state->property_capacity = max_properties;
+  state->subscribers = subscribers;
+  state->subscriber_capacity = max_subscribers;
+  /* Clear caller-provided subscriber slots so the `in_use` sentinel starts
+   * zero. That field is a midi2 implementation detail, not part of the
+   * caller contract, so init owns it. */
+  if (subscribers != NULL && max_subscribers > 0) {
+    memset(subscribers, 0, sizeof(midi2_ci_subscriber) * max_subscribers);
+  }
+  state->auto_invalidate_on_collision = true; /* v0.3.0+ default on */
+}
+
+void midi2_ci_init(midi2_ci_state *state, uint32_t muid_seed,
+                     uint8_t (*profiles)[5], uint8_t max_profiles,
+                     midi2_ci_property *properties, uint8_t max_properties) {
+  midi2_ci_init_ex(state, muid_seed,
+                    profiles, max_profiles,
+                    properties, max_properties,
+                    NULL, 0);
 }
 
 void midi2_ci_set_identity(midi2_ci_state *state,
@@ -52,6 +81,39 @@ void midi2_ci_set_write_fn(midi2_ci_state *state,
                               midi2_proc_write_fn write_fn, void *context) {
   state->write_fn = write_fn;
   state->write_context = context;
+}
+
+void midi2_ci_set_rng(midi2_ci_state *state,
+                         midi2_ci_rng_fn rng, void *context) {
+  state->rng         = rng;
+  state->rng_context = context;
+}
+
+void midi2_ci_set_nak_on_unknown(midi2_ci_state *state, bool enabled) {
+  state->nak_on_unknown = enabled;
+}
+
+void midi2_ci_set_auto_invalidate_on_collision(midi2_ci_state *state, bool enabled) {
+  if (state == NULL) return;
+  state->auto_invalidate_on_collision = enabled;
+}
+
+uint32_t midi2_ci_new_muid(midi2_ci_state *state) {
+  uint32_t m;
+  uint8_t tries = 0;
+  do {
+    if (state->rng) {
+      m = state->rng(state->rng_context) & 0x0FFFFFFFu;
+    } else {
+      /* Fallback: perturb current MUID. Better than returning a reserved
+       * value. Real devices should always install an RNG. */
+      m = (state->muid * 1103515245u + 12345u) & 0x0FFFFFFFu;
+    }
+    if (++tries > 8) break; /* avoid pathological loop */
+  } while (m == 0u || m == 0x0FFFFFFFu);
+  if (m == 0u || m == 0x0FFFFFFFu) m = 0x12345678u; /* hard fallback */
+  state->muid = m;
+  return m;
 }
 
 /*--------------------------------------------------------------------+
@@ -91,6 +153,7 @@ int midi2_ci_add_property_static(midi2_ci_state *state,
   state->properties[state->property_count].static_value = value;
   state->properties[state->property_count].getter = NULL;
   state->properties[state->property_count].setter = NULL;
+  state->properties[state->property_count].subscribable = false; /* v0.3.0+ */
   state->property_count++;
   return MIDI2_CI_OK;
 }
@@ -105,8 +168,118 @@ int midi2_ci_add_property_dynamic(midi2_ci_state *state,
   state->properties[state->property_count].static_value = NULL;
   state->properties[state->property_count].getter = getter;
   state->properties[state->property_count].setter = setter;
+  state->properties[state->property_count].subscribable = false; /* v0.3.0+ */
   state->property_count++;
   return MIDI2_CI_OK;
+}
+
+int midi2_ci_remove_property(midi2_ci_state *state, const char *name) {
+  uint8_t i;
+  if (state == NULL || name == NULL) return MIDI2_CI_ERR_NOT_FOUND;
+  for (i = 0; i < state->property_count; i++) {
+    if (state->properties[i].name != NULL
+        && strcmp(state->properties[i].name, name) == 0) {
+      uint8_t j;
+      for (j = i; j + 1 < state->property_count; j++) {
+        state->properties[j] = state->properties[j + 1];
+      }
+      state->property_count--;
+      return MIDI2_CI_OK;
+    }
+  }
+  return MIDI2_CI_ERR_NOT_FOUND;
+}
+
+void midi2_ci_reset_profiles(midi2_ci_state *state) {
+  if (state == NULL) return;
+  state->profile_count = 0;
+}
+
+void midi2_ci_reset_properties(midi2_ci_state *state) {
+  if (state == NULL) return;
+  state->property_count = 0;
+}
+
+/*--------------------------------------------------------------------+
+ * Subscribe / Notify (v0.3.0)
+ *
+ * Registry is caller-provided (state->subscribers). Each slot carries
+ * a stable 36-char copy of the resource name so the responder does
+ * not depend on app-owned string lifetimes.
+ *--------------------------------------------------------------------*/
+static int find_property_idx(const midi2_ci_state *state, const char *name) {
+  uint8_t i;
+  if (state == NULL || name == NULL) return -1;
+  for (i = 0; i < state->property_count; i++) {
+    if (state->properties[i].name != NULL
+        && strcmp(state->properties[i].name, name) == 0) {
+      return (int)i;
+    }
+  }
+  return -1;
+}
+
+static int find_subscriber_idx(const midi2_ci_state *state, uint32_t muid,
+                                const char *name) {
+  uint8_t i;
+  if (state == NULL || state->subscribers == NULL || name == NULL) return -1;
+  for (i = 0; i < state->subscriber_capacity; i++) {
+    if (!state->subscribers[i].in_use) continue;
+    if (state->subscribers[i].caller_muid != muid) continue;
+    if (strncmp(state->subscribers[i].name_copy, name, 36) != 0) continue;
+    return (int)i;
+  }
+  return -1;
+}
+
+int midi2_ci_pe_set_subscribable(midi2_ci_state *state, const char *name,
+                                  bool subscribable) {
+  int idx = find_property_idx(state, name);
+  if (idx < 0) return MIDI2_CI_ERR_NOT_FOUND;
+  state->properties[idx].subscribable = subscribable;
+  return MIDI2_CI_OK;
+}
+
+int midi2_ci_subscribe_add(midi2_ci_state *state, uint32_t caller_muid,
+                            const char *resource_name) {
+  uint8_t i;
+  int pi;
+  size_t n;
+  if (state == NULL || resource_name == NULL) return MIDI2_CI_ERR_NOT_FOUND;
+  if (state->subscribers == NULL) return MIDI2_CI_ERR_FULL;
+  pi = find_property_idx(state, resource_name);
+  if (pi < 0) return MIDI2_CI_ERR_NOT_FOUND;
+  if (!state->properties[pi].subscribable) return MIDI2_CI_ERR_NOT_FOUND;
+  if (find_subscriber_idx(state, caller_muid, resource_name) >= 0) {
+    return MIDI2_CI_OK; /* idempotent duplicate */
+  }
+  for (i = 0; i < state->subscriber_capacity; i++) {
+    if (state->subscribers[i].in_use) continue;
+    state->subscribers[i].caller_muid = caller_muid;
+    n = strlen(resource_name);
+    if (n > 36) n = 36;
+    memcpy(state->subscribers[i].name_copy, resource_name, n);
+    state->subscribers[i].name_copy[n] = '\0';
+    state->subscribers[i].in_use = 1;
+    state->subscriber_count++;
+    return MIDI2_CI_OK;
+  }
+  return MIDI2_CI_ERR_FULL;
+}
+
+int midi2_ci_subscribe_remove(midi2_ci_state *state, uint32_t caller_muid,
+                               const char *resource_name) {
+  int idx = find_subscriber_idx(state, caller_muid, resource_name);
+  if (idx < 0) return MIDI2_CI_ERR_NOT_FOUND;
+  state->subscribers[idx].in_use = 0;
+  state->subscribers[idx].caller_muid = 0;
+  state->subscribers[idx].name_copy[0] = '\0';
+  state->subscriber_count--;
+  return MIDI2_CI_OK;
+}
+
+uint8_t midi2_ci_get_subscriber_count(const midi2_ci_state *state) {
+  return (state == NULL) ? 0u : state->subscriber_count;
 }
 
 /*--------------------------------------------------------------------+
@@ -120,6 +293,62 @@ static void ci_send(midi2_ci_state *state, uint8_t group,
 }
 
 /*--------------------------------------------------------------------+
+ * PE Notify fan-out (v0.3.0)
+ *
+ * Walks the subscriber registry and, for every slot matching the
+ * resource name, emits a PE Notify frame carrying a minimal JSON
+ * header `{"resource":"<name>"}`. The actual property value is not
+ * embedded; consumers issue a PE Get to fetch the new value. Matches
+ * the common M2-103 pattern for PE where Notify signals invalidation.
+ *--------------------------------------------------------------------*/
+int midi2_ci_notify_property_changed(midi2_ci_state *state,
+                                      const char *resource_name) {
+  /* JSON header template `{"resource":"<name>"}`. <name> is bounded by
+   * MIDI2_CI_RESOURCE_NAME_MAX (36 per M2-105) and stored in the
+   * subscriber's name_copy slot, so the worst-case header is
+   * 13 (prefix) + 36 (name) + 2 (suffix) = 51 bytes. Buffer of 64 is
+   * comfortable. No <stdio.h> dependency. */
+  static const char HDR_PREFIX[] = "{\"resource\":\"";
+  static const char HDR_SUFFIX[] = "\"}";
+  uint8_t i;
+  int pi;
+  if (state == NULL || resource_name == NULL) return MIDI2_CI_ERR_NOT_FOUND;
+  pi = find_property_idx(state, resource_name);
+  if (pi < 0) return MIDI2_CI_ERR_NOT_FOUND;
+  if (state->write_fn == NULL || state->subscribers == NULL) return MIDI2_CI_OK;
+
+  for (i = 0; i < state->subscriber_capacity; i++) {
+    if (!state->subscribers[i].in_use) continue;
+    if (strncmp(state->subscribers[i].name_copy, resource_name, 36) != 0) continue;
+
+    uint8_t frame[128];
+    uint8_t hdr[64];
+    uint16_t hdr_n = 0;
+    size_t name_len = strlen(state->subscribers[i].name_copy);
+    if (name_len > 36u) name_len = 36u;
+
+    memcpy(hdr + hdr_n, HDR_PREFIX, sizeof HDR_PREFIX - 1u);
+    hdr_n = (uint16_t)(hdr_n + (sizeof HDR_PREFIX - 1u));
+    memcpy(hdr + hdr_n, state->subscribers[i].name_copy, name_len);
+    hdr_n = (uint16_t)(hdr_n + name_len);
+    memcpy(hdr + hdr_n, HDR_SUFFIX, sizeof HDR_SUFFIX - 1u);
+    hdr_n = (uint16_t)(hdr_n + (sizeof HDR_SUFFIX - 1u));
+
+    uint16_t frame_n = midi2_ci_build_pe_notify(
+        frame, MIDI2_CI_VERSION_1,
+        state->muid,
+        state->subscribers[i].caller_muid,
+        0 /* request_id */,
+        hdr, hdr_n,
+        1, 1,
+        NULL, 0);
+    if (frame_n == 0) continue;
+    ci_send(state, 0 /* group */, frame, frame_n);
+  }
+  return MIDI2_CI_OK;
+}
+
+/*--------------------------------------------------------------------+
  * Discovery Reply -- uses midi2_ci_build_discovery_reply
  *--------------------------------------------------------------------*/
 static bool ci_handle_discovery(midi2_ci_state *state, uint8_t group,
@@ -127,7 +356,14 @@ static bool ci_handle_discovery(midi2_ci_state *state, uint8_t group,
   if (length < 13 || state->manufacturer_id == 0) return false;
 
   uint32_t src_muid = midi2_ci_get_src_muid(data);
-  uint8_t ci_cat = MIDI2_CI_CAT_PROFILE_CONFIG | MIDI2_CI_CAT_PROPERTY_EXCHANGE;
+  /* Declare every CI Category the convenience responder actually handles.
+   * The handlers for Profile Inquiry, PE, and PI Capability all live here;
+   * Discovery must advertise them so Initiators know to send the related
+   * inquiries. Bug present through v0.2.3: Process Inquiry was handled but
+   * not announced. */
+  uint8_t ci_cat = MIDI2_CI_CAT_PROFILE_CONFIG
+                 | MIDI2_CI_CAT_PROPERTY_EXCHANGE
+                 | MIDI2_CI_CAT_PROCESS_INQUIRY;
 
   uint8_t reply[32];
   uint16_t reply_len = midi2_ci_build_discovery_reply(
@@ -154,6 +390,29 @@ static void ci_handle_profile_inquiry(midi2_ci_state *state, uint8_t group,
       midi2_ci_get_device_id(data),
       (const uint8_t (*)[5])state->profiles, state->profile_count,
       NULL, 0);
+
+  ci_send(state, group, reply, reply_len);
+}
+
+/*--------------------------------------------------------------------+
+ * PE Capability Reply -- uses midi2_ci_build_pe_capability_reply
+ *
+ * Parallels Profile Inquiry and PI Capability: without this, an
+ * Initiator asking "do you do PE?" gets no answer and never tries
+ * PE GET/SET. Advertises max_simultaneous=1 and PE v1.0 (basic).
+ *--------------------------------------------------------------------*/
+static void ci_handle_pe_capability(midi2_ci_state *state, uint8_t group,
+                                      const uint8_t *data, uint16_t length) {
+  if (length < 13) return;
+
+  uint32_t src_muid = midi2_ci_get_src_muid(data);
+
+  uint8_t reply[24];
+  uint16_t reply_len = midi2_ci_build_pe_capability_reply(
+      reply, MIDI2_CI_VERSION_2, state->muid, src_muid,
+      /*max_simultaneous*/ 1,
+      /*pe_ver_major*/     1,
+      /*pe_ver_minor*/     0);
 
   ci_send(state, group, reply, reply_len);
 }
@@ -221,6 +480,64 @@ static void ci_handle_pe_set(midi2_ci_state *state, uint8_t group,
 }
 
 /*--------------------------------------------------------------------+
+ * Invalidate MUID handler (M2-101-UM §3.5 + Appendix E)
+ *
+ * If the message's target MUID matches ours, regenerate it via the
+ * installed RNG. Without an RNG the request is silently ignored (v0.2.3
+ * behavior preserved).
+ *--------------------------------------------------------------------*/
+static void ci_handle_invalidate_muid(midi2_ci_state *state, uint8_t group,
+                                         const uint8_t *data, uint16_t length) {
+  (void)group;
+  if (length < 17) return;
+  if (!state->rng) return;
+  uint32_t target = midi2_ci_get_target_muid(data);
+  if (target != state->muid) return;
+  midi2_ci_new_muid(state);
+}
+
+/*--------------------------------------------------------------------+
+ * MUID collision detection (M2-101-UM Appendix E §2)
+ *
+ * Any inbound CI message whose src_muid matches ours means a peer is
+ * using our MUID. Resolution: pick a new MUID and broadcast Invalidate
+ * for the old value. No-op without an RNG.
+ *--------------------------------------------------------------------*/
+static void ci_check_muid_collision(midi2_ci_state *state, uint8_t group,
+                                       uint32_t peer_src_muid) {
+  if (!state->rng) return;
+  if (peer_src_muid != state->muid) return;
+  uint32_t old = state->muid;
+  midi2_ci_new_muid(state);
+  if (!state->write_fn) return;
+  if (!state->auto_invalidate_on_collision) return;
+  uint8_t buf[24];
+  uint16_t len = midi2_ci_build_invalidate_muid(
+      buf, MIDI2_CI_VERSION_1, state->muid, old);
+  ci_send(state, group, buf, len);
+}
+
+/*--------------------------------------------------------------------+
+ * NAK builder (M2-101-UM Appendix E)
+ *
+ * Build a Sub-ID#2 0x7F NAK with status NOT_SUPPORTED for a given
+ * original sub-id. Used when nak_on_unknown is enabled.
+ *--------------------------------------------------------------------*/
+static void ci_send_nak_not_supported(midi2_ci_state *state, uint8_t group,
+                                         const uint8_t *data,
+                                         uint8_t orig_sub_id) {
+  if (!state->write_fn) return;
+  uint32_t src_muid = midi2_ci_get_src_muid(data);
+  uint8_t device_id = midi2_ci_get_device_id(data);
+  uint8_t buf[32];
+  uint16_t len = midi2_ci_build_nak(
+      buf, MIDI2_CI_VERSION_2, state->muid, src_muid, device_id,
+      orig_sub_id, MIDI2_CI_NAK_NOT_SUPPORTED, 0,
+      NULL, 0, NULL);
+  ci_send(state, group, buf, len);
+}
+
+/*--------------------------------------------------------------------+
  * Process Inquiry handler -- uses midi2_ci_build_pi_capability_reply
  *--------------------------------------------------------------------*/
 static void ci_handle_process_inquiry(midi2_ci_state *state, uint8_t group,
@@ -243,12 +560,25 @@ bool midi2_ci_process_sysex(midi2_ci_state *state,
                                uint8_t group, const uint8_t *data, uint16_t length) {
   if (!midi2_ci_is_ci(data, length)) return false;
 
-  switch (midi2_ci_get_sub_id(data)) {
+  /* Every inbound CI message is an opportunity to detect MUID collisions.
+   * Do this before dispatching so a reply (if any) carries the new MUID. */
+  ci_check_muid_collision(state, group, midi2_ci_get_src_muid(data));
+
+  uint8_t sub_id = midi2_ci_get_sub_id(data);
+  switch (sub_id) {
     case MIDI2_CI_DISCOVERY:
       return ci_handle_discovery(state, group, data, length);
 
+    case MIDI2_CI_INVALIDATE_MUID:
+      ci_handle_invalidate_muid(state, group, data, length);
+      return true;
+
     case MIDI2_CI_PROFILE_INQUIRY:
       ci_handle_profile_inquiry(state, group, data, length);
+      return true;
+
+    case MIDI2_CI_PE_CAPABILITY:
+      ci_handle_pe_capability(state, group, data, length);
       return true;
 
     case MIDI2_CI_PE_GET:
@@ -264,6 +594,14 @@ bool midi2_ci_process_sysex(midi2_ci_state *state,
       return true;
 
     default:
+      /* Appendix E: "Be able to send a NAK message when appropriate."
+       * When nak_on_unknown is set, reply with Sub-ID#2 0x7F
+       * status NOT_SUPPORTED. Otherwise the v0.2.3 behavior (silent
+       * fall-through to return false) is preserved. */
+      if (state->nak_on_unknown) {
+        ci_send_nak_not_supported(state, group, data, sub_id);
+        return true;
+      }
       return false;
   }
 }
