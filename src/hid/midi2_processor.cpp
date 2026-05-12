@@ -124,8 +124,9 @@ void Midi2Processor::OnConfigRequest(uint8_t protocol,
     Midi2Processor* self = static_cast<Midi2Processor*>(ctx);
     uint32_t        w[4];
 
-    /* Accept whatever protocol the host requests */
-    midi2_msg_stream_config_notify(w, protocol);
+    /* Accept whatever protocol the host requests. JR Timestamps stay
+     * disabled in this responder (no JR heartbeat is emitted). */
+    midi2_msg_stream_config_notify(w, protocol, /*rx_jr*/ false, /*tx_jr*/ false);
     self->SendUmp(w, 4);
 }
 
@@ -136,8 +137,19 @@ void Midi2Processor::OnFbDiscovery(uint8_t /*fb_num*/,
     Midi2Processor* self = static_cast<Midi2Processor*>(ctx);
     uint32_t        w[4];
 
-    /* 1 function block, bidirectional, group 0, 1 group, auto protocol */
-    midi2_msg_stream_fb_info(w, true, 0, 0x00, 0, 1, 0x01, false, 0x00);
+    /* 1 function block, bidirectional, ui_hint Receiver (default for a
+     * Daisy that listens), group 0, 1 group, MIDI-CI 1.1, no SysEx8,
+     * auto protocol. */
+    midi2_msg_stream_fb_info(w,
+                             /*active*/ true,
+                             /*fb_num*/ 0,
+                             /*direction*/ 0x00,
+                             /*ui_hint*/ 0x01,
+                             /*first_group*/ 0,
+                             /*num_groups*/ 1,
+                             /*midi_ci_ver*/ 0x01,
+                             /*max_sysex8_streams*/ 0,
+                             /*protocol*/ 0x00);
     self->SendUmp(w, 4);
 }
 

@@ -14,11 +14,8 @@
 #include "daisy_seed.h"
 #include "usbh_midi.h"
 
-extern "C"
-{
-#include "hid/midi2/midi2_ci_msg.h"
-#include "hid/midi2/midi2_proc.h"
-}
+/* midi2 C99 surface (CI message builders, dispatch, proc) comes in via
+ * daisy_seed.h -> hid/midi2_processor.h -> hid/midi2/midi2.h (amalgam). */
 
 using namespace daisy;
 
@@ -93,7 +90,9 @@ void SendCIDiscovery()
         ci->family_id,
         ci->model_id,
         ci->version_id,
-        MIDI2_CI_CAT_PROFILE_CONFIG | MIDI2_CI_CAT_PROPERTY_EXCHANGE,
+        MIDI2_CI_CAT_PROFILE_CONFIG
+            | MIDI2_CI_CAT_PROPERTY_EXCHANGE
+            | MIDI2_CI_CAT_PROCESS_INQUIRY,
         512,    /* max sysex size */
         0);     /* output path ID */
 

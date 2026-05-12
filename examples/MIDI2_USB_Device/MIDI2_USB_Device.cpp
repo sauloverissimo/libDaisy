@@ -34,16 +34,16 @@ static volatile uint8_t echo_note = 0;
 static volatile uint8_t echo_vel  = 0;
 static volatile bool    do_echo   = false;
 
-void OnNoteOn(uint8_t  g,
-              uint8_t  ch,
+void OnNoteOn(uint8_t  /*group*/,
+              uint8_t  /*channel*/,
               uint8_t  note,
-              uint16_t vel,
-              uint8_t  at,
-              uint16_t ad,
-              void*    ctx)
+              uint16_t velocity16,
+              uint8_t  /*attr_type*/,
+              uint16_t /*attr_data*/,
+              void*    /*ctx*/)
 {
     echo_note = note;
-    echo_vel  = (uint8_t)(vel >> 9);
+    echo_vel  = midi2_msg_scale_down_16to7(velocity16);
     do_echo   = true;
 }
 
@@ -111,8 +111,9 @@ int main(void)
             if(usbd_midi2_alt_setting == 1)
             {
                 uint32_t w[2];
-                midi2_msg_note_on(w, 0, 0, echo_note,
-                                  midi2_msg_scale_up_7to16(echo_vel), 0);
+                midi2_msg_note_on(w, /*group*/ 0, /*ch*/ 0, echo_note,
+                                  midi2_msg_scale_up_7to16(echo_vel),
+                                  /*attr_type*/ 0, /*attr_data*/ 0);
                 midi.SendUmpMessage(w, 2);
             }
             else
@@ -141,11 +142,16 @@ int main(void)
                 case 0: /* Note On */
                     if(prev_note > 0)
                     {
-                        midi2_msg_note_off(w, 0, 0, prev_note, 0x8000, 0);
+                        midi2_msg_note_off(w, /*group*/ 0, /*ch*/ 0,
+                                           prev_note, 0x8000,
+                                           /*attr_type*/ 0,
+                                           /*attr_data*/ 0);
                         midi.SendUmpMessage(w, 2);
                     }
-                    midi2_msg_note_on(
-                        w, 0, 0, arp_notes[arp_idx], 0xC000, 0);
+                    midi2_msg_note_on(w, /*group*/ 0, /*ch*/ 0,
+                                      arp_notes[arp_idx], 0xC000,
+                                      /*attr_type*/ 0,
+                                      /*attr_data*/ 0);
                     midi.SendUmpMessage(w, 2);
                     prev_note = arp_notes[arp_idx];
                     arp_idx   = (arp_idx + 1) % 4;

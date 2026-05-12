@@ -247,7 +247,7 @@ TEST_F(Midi2ProcessorTest, feedUmpNoteOn)
 
     // Build a MIDI 2.0 NoteOn UMP (MT 0x4)
     uint32_t w[2];
-    midi2_msg_note_on(w, 0, 5, 72, 0xC000, 0);
+    midi2_msg_note_on(w, 0, 5, 72, 0xC000, 0, 0);
     proc.FeedUmp(w, 2);
 
     EXPECT_EQ(note_on_count, 1u);
@@ -287,7 +287,7 @@ TEST_F(Midi2ProcessorTest, ciIdentityIsSet)
 TEST_F(Midi2ProcessorTest, sendUmpTriggersTx)
 {
     uint32_t w[2];
-    midi2_msg_note_on(w, 0, 0, 60, 0x8000, 0);
+    midi2_msg_note_on(w, 0, 0, 60, 0x8000, 0, 0);
     proc.SendUmp(w, 2);
 
     EXPECT_EQ(tx_data.size(), 8u); // 2 words * 4 bytes
