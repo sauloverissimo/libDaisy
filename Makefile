@@ -5,11 +5,7 @@ MODULE_DIR=src
 C_MODULES = \
 sys/dma \
 hid/audio \
-hid/midi2/midi2_conv \
-hid/midi2/midi2_proc \
-hid/midi2/midi2_dispatch \
-hid/midi2/midi2_ci \
-hid/midi2/midi2_ci_dispatch \
+hid/midi2/midi2 \
 per/gpio \
 per/sai \
 per/sdmmc \

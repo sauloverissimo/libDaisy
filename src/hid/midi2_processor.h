@@ -9,10 +9,11 @@
 extern "C"
 {
 #endif
-#include "hid/midi2/midi2_conv.h"
-#include "hid/midi2/midi2_proc.h"
-#include "hid/midi2/midi2_ci.h"
-#include "hid/midi2/midi2_dispatch.h"
+// midi2 v0.4.0 vendored stb-style: single header carries every module
+// (msg / dispatch / proc / conv / ci / ci_msg / ci_dispatch). The
+// matching midi2.c defines MIDI2_IMPLEMENTATION and is listed under
+// C_MODULES in libdaisy's Makefile.
+#include "hid/midi2/midi2.h"
 #ifdef __cplusplus
 }
 #endif
