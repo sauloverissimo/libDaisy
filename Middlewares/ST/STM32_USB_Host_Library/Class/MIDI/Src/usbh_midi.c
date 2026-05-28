@@ -54,6 +54,7 @@ static USBH_StatusTypeDef USBH_MIDI_InterfaceInit(USBH_HandleTypeDef *phost)
     MIDI_Handle = (MIDI_HandleTypeDef*)phost->pActiveClass->pData;
     USBH_memset(MIDI_Handle, 0, sizeof(MIDI_HandleTypeDef));
 
+    /* Find MIDI Streaming interface (Alt 0 first) */
     uint8_t interface = USBH_FindInterface(phost, phost->pActiveClass->ClassCode,
             USB_MIDI_STREAMING_SUBCLASS, 0xFFU);
 
@@ -61,10 +62,30 @@ static USBH_StatusTypeDef USBH_MIDI_InterfaceInit(USBH_HandleTypeDef *phost)
         USBH_DbgLog("Cannot find interface for %s class.", phost->pActiveClass->Name);
         return USBH_FAIL;
     }
+
+    /* Check if device has Alt 1 (MIDI 2.0 UMP) */
+    uint8_t ifnum = phost->device.CfgDesc.Itf_Desc[interface].bInterfaceNumber;
+    uint8_t alt1_idx = USBH_FindInterfaceIndex(phost, ifnum, 1U);
+    uint8_t use_alt = 0U;
+
+    if (alt1_idx != 0xFFU) {
+        /* Device supports MIDI 2.0 -- select Alt 1 */
+        interface = alt1_idx;
+        use_alt = 1U;
+        USBH_UsrLog("MIDI 2.0 Alt 1 found, selecting UMP mode");
+    }
+
     status = USBH_SelectInterface(phost, interface);
     if (status != USBH_OK) {
         return USBH_FAIL;
     }
+
+    /* Send SET_INTERFACE if using Alt 1 */
+    if (use_alt == 1U) {
+        USBH_SetInterface(phost, ifnum, 1U);
+    }
+
+    MIDI_Handle->altSetting = use_alt;
 
     /* Find the endpoints */
     for (int ep = 0; ep < phost->device.CfgDesc.Itf_Desc[interface].bNumEndpoints; ++ep) {
@@ -209,6 +230,15 @@ static USBH_StatusTypeDef USBH_MIDI_SOFProcess(USBH_HandleTypeDef *phost)
     /* Prevent unused argument(s) compilation warning */
     UNUSED(phost);
     return USBH_OK;
+}
+
+uint8_t USBH_MIDI_GetAltSetting(USBH_HandleTypeDef *phost)
+{
+    MIDI_HandleTypeDef *hMidi = (MIDI_HandleTypeDef*)phost->pActiveClass->pData;
+    if (hMidi) {
+        return hMidi->altSetting;
+    }
+    return 0U;
 }
 
 void USBH_MIDI_SetReceiveCallback(USBH_HandleTypeDef *phost, USBH_MIDI_RxCallback cb, void* pUser)
